@@ -5,14 +5,9 @@ const io = require('socket.io')(http);
 const path = require('path');
 
 app.use(express.static(__dirname));
-
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'index.html'));
-});
-
 let matchmakingLobbies = { coop: [], versus: [] };
 let activeGames = {};
-let playerToRoomMap = {}; // Tracciamento certo e istantaneo del giocatore
+let playerToRoomMap = {}; 
 
 const AVAILABLE_COLORS = ['red', 'blue', 'green', 'yellow', 'purple', 'orange'];
 
@@ -40,7 +35,6 @@ io.on('connection', (socket) => {
             p1.roomId = roomId;
             p2.roomId = roomId;
 
-            // Salva nella mappa globale dei record prima del via
             playerToRoomMap[p1.id] = roomId;
             playerToRoomMap[p2.id] = roomId;
 
@@ -48,9 +42,10 @@ io.on('connection', (socket) => {
                 id: roomId,
                 mode: mode,
                 players: [p1, p2],
-                secretCode: generateSecretCode(),
+                // Versus ha codici separati per i due giocatori, Coop ha un codice unico condiviso
+                secretCode: mode === 'versus' ? { [p1.id]: generateSecretCode(), [p2.id]: generateSecretCode() } : generateSecretCode(),
                 turn: 0,
-                round: 1
+                round: mode === 'versus' ? { [p1.id]: 1, [p2.id]: 1 } : 1
             };
 
             io.sockets.sockets.get(p1.id)?.join(roomId);
@@ -60,7 +55,7 @@ io.on('connection', (socket) => {
                 mode: mode,
                 players: activeGames[roomId].players,
                 turn: activeGames[roomId].turn,
-                round: activeGames[roomId].round
+                round: 1
             });
         }
     });
@@ -75,7 +70,7 @@ io.on('connection', (socket) => {
 
         if (game.mode === 'coop' && game.turn !== playerIdx) return; 
 
-        let secret = game.secretCode;
+        let secret = game.mode === 'versus' ? game.secretCode[socket.id] : game.secretCode;
         let result = Array(4).fill("");
         let codeCopy = [...secret];
 
@@ -96,42 +91,74 @@ io.on('connection', (socket) => {
 
         if (wonRound) {
             game.players[playerIdx].score += Math.max(100, 1000 - (game.players[playerIdx].attemptsCount * 100));
-            game.round++;
-            game.players[0].attemptsCount = 0;
-            game.players[1].attemptsCount = 0;
-            game.secretCode = generateSecretCode();
-            
-            if (game.round > 5) {
-                let winnerName = "Pareggio";
-                if(game.players[0].score > game.players[1].score) winnerName = game.players[0].name;
-                else if(game.players[1].score > game.players[0].score) winnerName = game.players[1].name;
+            game.players[playerIdx].attemptsCount = 0;
+
+            if (game.mode === 'versus') {
+                game.round[socket.id]++;
                 
-                io.to(targetRoomId).emit('roundResult', { matchWinner: winnerName, players: game.players, guess, result });
+                // Fine partita se superiamo il settimo round
+                if (game.round[socket.id] > 7) {
+                    let lAltro = game.players.find(p => p.id !== socket.id);
+                    if (game.round[lAltro.id] > 7) {
+                        let winnerName = "Pareggio";
+                        if(game.players[0].score > game.players[1].score) winnerName = game.players[0].name;
+                        else if(game.players[1].score > game.players[0].score) winnerName = game.players[1].name;
+                        
+                        io.to(targetRoomId).emit('roundResult', { matchWinner: winnerName, players: game.players, guess, result });
+                        game.players.forEach(p => delete playerToRoomMap[p.id]);
+                        delete activeGames[targetRoomId];
+                        return;
+                    } else {
+                        socket.emit('roundResult', { roundFinished: true, nextRound: "In attesa dell'avversario...", players: game.players, guess, result });
+                        return;
+                    }
+                }
+
+                game.secretCode[socket.id] = generateSecretCode();
+                socket.emit('roundResult', { roundFinished: true, nextRound: game.round[socket.id], players: game.players, guess, result });
                 
-                // Pulisci mappe
-                game.players.forEach(p => delete playerToRoomMap[p.id]);
-                delete activeGames[targetRoomId];
+                let lAltro = game.players.find(p => p.id !== socket.id);
+                io.to(targetRoomId).emit('roundResult', { currentRound: game.round[lAltro.id], players: game.players });
                 return;
             } else {
-                game.turn = (game.turn + 1) % 2;
-                io.to(targetRoomId).emit('roundResult', { roundFinished: true, nextTurn: game.turn, nextRound: game.round, players: game.players, guess, result });
-                return;
+                // Logica COOP
+                game.round++;
+                game.secretCode = generateSecretCode();
+                
+                if (game.round > 7) {
+                    io.to(targetRoomId).emit('roundResult', { matchWinner: `Vittoria di Squadra! Punteggio totale: ${game.players[0].score + game.players[1].score}`, players: game.players, guess, result });
+                    game.players.forEach(p => delete playerToRoomMap[p.id]);
+                    delete activeGames[targetRoomId];
+                    return;
+                } else {
+                    game.turn = (game.turn + 1) % 2;
+                    io.to(targetRoomId).emit('roundResult', { roundFinished: true, nextTurn: game.turn, nextRound: game.round, players: game.players, guess, result });
+                    return;
+                }
             }
         }
 
+        // Se il tentativo non risolve il codice:
         if (game.mode === 'coop') {
             game.turn = (game.turn + 1) % 2;
+            io.to(targetRoomId).emit('roundResult', {
+                playerId: socket.id,
+                guess: guess,
+                result: result,
+                nextTurn: game.turn,
+                currentRound: game.round,
+                players: game.players
+            });
+        } else {
+            // Nel VERSUS inviamo solo al mittente per mantenere il segreto
+            socket.emit('roundResult', {
+                playerId: socket.id,
+                guess: guess,
+                result: result,
+                currentRound: game.round[socket.id],
+                players: game.players
+            });
         }
-
-        // Spedisce a tutta la stanza (incluso il mittente) per aggiornare i display dei feedback di entrambi
-        io.to(targetRoomId).emit('roundResult', {
-            playerId: socket.id,
-            guess: guess,
-            result: result,
-            nextTurn: game.turn,
-            currentRound: game.round,
-            players: game.players
-        });
     });
 
     function handleDisconnectOrLeave() {
@@ -165,6 +192,8 @@ io.on('connection', (socket) => {
     socket.on('disconnect', handleDisconnectOrLeave);
 });
 
-http.listen(3000, () => {
-    console.log('Server di Mastermind Pro avviato su http://localhost:3000');
+// Porta dinamica per il cloud (obbligatoria per Render)
+const PORT = process.env.PORT || 3000;
+http.listen(PORT, () => {
+    console.log(`Server online sulla porta ${PORT}`);
 });
