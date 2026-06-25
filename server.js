@@ -1,7 +1,13 @@
 const express = require('express');
 const app = express();
 const http = require('http').createServer(app);
-const io = require('socket.io')(http);
+const io = require('socket.io')(http, {
+    cors: {
+        origin: "*", // Accetta connessioni da qualsiasi sito, incluso Netlify
+        methods: ["GET", "POST"],
+        transports: ["websocket"] // Forza l'uso dei websocket anche lato server
+    }
+});
 const path = require('path');
 
 app.use(express.static(__dirname));
